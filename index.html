@@ -380,21 +380,32 @@
 
        function createWarningSprite() {
             const canvas = document.createElement('canvas');
-            // 1. 设置为 1:1 的正方形画布 (96x96)
             canvas.width = 96;
             canvas.height = 96;
             const ctx = canvas.getContext('2d');
 
-            // 2. 绘制正方形背景框（ roundedRect 的圆角大小设为 12）
+            // 使用最稳妥的路径算法绘制圆角正方形，规避 roundRect 兼容性报错
+            const x = 8, y = 8, w = 80, h = 80, r = 12;
             ctx.fillStyle = 'rgba(220, 38, 38, 0.9)';
             ctx.beginPath();
-            ctx.roundRect(8, 8, 80, 80, 12); // (x, y, 宽, 高, 圆角半径)
+            ctx.moveTo(x + r, y);
+            ctx.lineTo(x + w - r, y);
+            ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+            ctx.lineTo(x + w, y + h - r);
+            ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+            ctx.lineTo(x + r, y + h);
+            ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+            ctx.lineTo(x, y + r);
+            ctx.quadraticCurveTo(x, y, x + r, y);
+            ctx.closePath();
             ctx.fill();
+
+            // 绘制白框
             ctx.lineWidth = 3;
             ctx.strokeStyle = '#ffffff';
             ctx.stroke();
 
-            // 3. 在正中心绘制 ⚠️ 图标
+            // 在正中心绘制 ⚠️ 符号
             ctx.fillStyle = '#ffffff';
             ctx.font = 'bold 36px Arial';
             ctx.textAlign = 'center';
@@ -405,7 +416,7 @@
             const spriteMaterial = new THREE.SpriteMaterial({ map: texture, depthTest: false });
             const sprite = new THREE.Sprite(spriteMaterial);
             
-            // 4. 3D 尺寸保持 1:1 正方形比例 (长宽都是 0.45)
+            // 3D 尺寸
             sprite.scale.set(0.45, 0.45, 1); 
             return sprite;
         }
