@@ -9,6 +9,50 @@
         #game-container { width: 100vw; height: 100vh; position: absolute; top:0; left:0; z-index: 1; }
         
         #ui-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10; pointer-events: none; }
+
+        /* 分阶段资源加载提示：首屏为遮罩，NPC 懒加载时自动切换为顶部提示条 */
+        #loading-overlay {
+            position: absolute; inset: 0; z-index: 3000;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(5, 5, 16, 0.94); color: #ffffff;
+            opacity: 1; visibility: visible; pointer-events: auto;
+            transition: opacity 0.25s ease, visibility 0.25s ease;
+        }
+        #loading-overlay.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+        #loading-overlay.compact {
+            inset: 24px auto auto 50%; transform: translateX(-50%);
+            width: min(520px, calc(100vw - 40px));
+            background: transparent; pointer-events: none;
+        }
+        .loading-card {
+            width: min(440px, calc(100vw - 72px)); padding: 28px 32px;
+            border: 2px solid #00ffcc; border-radius: 18px;
+            background: rgba(8, 23, 48, 0.96); text-align: center;
+            box-shadow: 0 0 28px rgba(0, 255, 204, 0.35);
+        }
+        #loading-overlay.compact .loading-card {
+            width: 100%; padding: 16px 20px; box-sizing: border-box;
+            pointer-events: none;
+        }
+        #loading-overlay.compact.error .loading-card { pointer-events: auto; }
+        .loading-spinner {
+            width: 42px; height: 42px; margin: 0 auto 16px;
+            border: 4px solid rgba(255, 255, 255, 0.18);
+            border-top-color: #00ffcc; border-radius: 50%;
+            animation: loading-spin 0.8s linear infinite;
+        }
+        #loading-overlay.compact .loading-spinner { width: 24px; height: 24px; margin-bottom: 8px; border-width: 3px; }
+        #loading-title { margin: 0 0 8px; color: #00ffcc; font-size: 22px; }
+        #loading-overlay.compact #loading-title { font-size: 17px; }
+        #loading-message { margin: 0 0 14px; color: #cbd5e1; font-size: 14px; }
+        .loading-progress-track { height: 8px; overflow: hidden; border-radius: 999px; background: #26354d; }
+        #loading-progress-bar { width: 0; height: 100%; background: linear-gradient(90deg, #00bfa6, #00ffcc); transition: width 0.18s ease; }
+        #loading-progress-text { margin-top: 8px; color: #9fffea; font-size: 12px; }
+        #loading-retry-btn {
+            display: none; margin: 14px auto 0; padding: 9px 18px;
+            border: 1px solid #ff6b6b; border-radius: 8px;
+            background: #7f1d1d; color: white; cursor: pointer;
+        }
         
         #ui-layer {
             position: absolute; top: 20px; left: 20px; color: white;
@@ -129,6 +173,7 @@
 
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         @keyframes pulse-banner { 0% { transform: translateX(-50%) scale(1); } 100% { transform: translateX(-50%) scale(1.02); } }
+        @keyframes loading-spin { to { transform: rotate(360deg); } }
         
         /* 文字气泡优雅上下浮动、淡入淡出动感特效 */
         @keyframes text-bubble-float {
@@ -143,6 +188,17 @@
 <body>
 
     <div id="game-container"></div>
+
+    <div id="loading-overlay" role="status" aria-live="polite" aria-busy="true">
+        <div class="loading-card">
+            <div class="loading-spinner"></div>
+            <h2 id="loading-title">正在加载训练场</h2>
+            <p id="loading-message">正在准备场景与玩家模型...</p>
+            <div class="loading-progress-track"><div id="loading-progress-bar"></div></div>
+            <div id="loading-progress-text">0%</div>
+            <button id="loading-retry-btn" type="button" onclick="retryLoading()">重新加载</button>
+        </div>
+    </div>
 
     <div id="ui-container">
         <div id="guide-banner">🚀 欢迎来到训练场！使用 W, A, S, D 移动，Space 跳跃，自由探索世界吧！</div>
@@ -212,14 +268,13 @@
         let glitchRobot;
         
         let npcA1, npcA2, npcB1;
-        let npcGroup = new THREE.Group(); 
+        let npcGroup; 
         
         let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
         let canJump = true;
         let playerVelocity = new THREE.Vector3();
         const PLAYER_SPEED = 14.0; const JUMP_FORCE = 10.0; const GRAVITY = 28.0; 
         let clock = new THREE.Clock();
-        const loader = new THREE.GLTFLoader();
 
         let idleMixer, walkMixer; 
         let currentActionState = "idle"; 
@@ -245,10 +300,18 @@
         let isGlitchArrived = false;
 
         let glitchMeshes = {};
+        let glitchActions = {};
         let currentGlitchState = '';
 
         let gameElapsedTime = 0;
         let currentPhase = 'exploration'; 
+        const NPC_LOAD_DELAY_SECONDS = 10.0;
+        let initialAssetsReady = false;
+        let npcAssetsReady = false;
+        let npcLoadState = 'idle'; // idle | loading | ready | error
+        let loadingErrorActive = false;
+        let displayedLoadingPercent = 0;
+        let loadingRetryMode = 'page';
 
         init();
         animate();
@@ -263,7 +326,7 @@
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.enabled = false;
             renderer.outputEncoding = THREE.sRGBEncoding; 
             document.getElementById('game-container').appendChild(renderer.domElement);
 
@@ -278,104 +341,305 @@
 
             const ambientLight = new THREE.AmbientLight(0xffffff, 1.8); scene.add(ambientLight);
             const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444466, 1.5); hemiLight.position.set(0, 100, 0); scene.add(hemiLight);
-            const dirLight = new THREE.DirectionalLight(0xffffff, 1.0); dirLight.position.set(50, 150, 50); scene.add(dirLight);
-
-            loader.load(MODEL_CONFIG.ground, function (gltf) { 
-                environmentMesh = gltf.scene;
-                const box = new THREE.Box3().setFromObject(environmentMesh);
-                const center = box.getCenter(new THREE.Vector3());
-                environmentMesh.position.x -= center.x;
-                environmentMesh.position.z -= center.z;
-                environmentMesh.position.y = SCENE_Y_OFFSET; 
-                scene.add(environmentMesh); 
-            });
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+            dirLight.position.set(50, 150, 50);
+            dirLight.castShadow = false;
+            scene.add(dirLight);
 
             player = new THREE.Group();
             player.position.set(0, 0, 0); 
             scene.add(player);
-            
-            loader.load(MODEL_CONFIG.playerIdle, function (gltf) {
-                playerIdleMesh = gltf.scene;
-                playerIdleMesh.scale.set(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE); 
-                player.add(playerIdleMesh);
-                if (gltf.animations && gltf.animations.length > 0) {
-                    idleMixer = new THREE.AnimationMixer(playerIdleMesh);
-                    idleMixer.clipAction(gltf.animations[0]).play();
-                }
-            });
-
-            loader.load(MODEL_CONFIG.playerWalk, function (gltf) {
-                playerWalkMesh = gltf.scene;
-                playerWalkMesh.scale.set(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE); 
-                playerWalkMesh.visible = false; 
-                player.add(playerWalkMesh);
-                if (gltf.animations && gltf.animations.length > 0) {
-                    walkMixer = new THREE.AnimationMixer(playerWalkMesh);
-                    walkMixer.clipAction(gltf.animations[0]).play();
-                }
-            });
 
             controls.target.copy(player.position);
-
-            scene.add(npcGroup);
-
-            const centerA = new THREE.Vector3(-2.8, 0, -3.5);
-            npcA1 = createTrackedNPC(MODEL_CONFIG.robotTalk1, new THREE.Vector3(-2.8, 0, -4.3), centerA);
-            npcA2 = createTrackedNPC(MODEL_CONFIG.robotTalk2, new THREE.Vector3(-3.5, 0, -3.0), centerA);
-            createTrackedNPC(MODEL_CONFIG.robotArgue, new THREE.Vector3(-2.1, 0, -3.0), centerA);
-
-            const posB1 = new THREE.Vector3(2.2, 0, -4.5);
-            const posB2 = new THREE.Vector3(3.4, 0, -4.5);
-            npcB1 = createTrackedNPC(MODEL_CONFIG.robotTalk1, posB1, posB2);
-            createTrackedNPC(MODEL_CONFIG.robotTalk2, posB2, posB1);
-
-            glitchRobot = new THREE.Group(); 
-            glitchRobot.position.copy(GLITCH_START_POS); 
-            npcGroup.add(glitchRobot); 
-            loadGlitchNPC(glitchRobot);
-
-            npcGroup.visible = false;
 
             window.addEventListener('keydown', onKeyDown);
             window.addEventListener('keyup', onKeyUp);
             window.addEventListener('resize', onWindowResize);
+
+            loadInitialAssets();
+        }
+
+        function showLoadingIndicator(title, message, compact = false) {
+            const overlay = document.getElementById('loading-overlay');
+            loadingErrorActive = false;
+            displayedLoadingPercent = 0;
+            loadingRetryMode = 'page';
+            overlay.classList.remove('hidden');
+            overlay.classList.remove('error');
+            overlay.classList.toggle('compact', compact);
+            overlay.setAttribute('aria-busy', 'true');
+            document.getElementById('loading-title').innerText = title;
+            document.getElementById('loading-message').innerText = message;
+            const progressBar = document.getElementById('loading-progress-bar');
+            progressBar.style.width = '0%';
+            progressBar.style.background = 'linear-gradient(90deg, #00bfa6, #00ffcc)';
+            document.getElementById('loading-progress-text').innerText = '0%';
+            document.getElementById('loading-retry-btn').style.display = 'none';
+            const spinner = overlay.querySelector('.loading-spinner');
+            spinner.style.animationPlayState = 'running';
+            spinner.style.borderTopColor = '#00ffcc';
+        }
+
+        function updateLoadingProgress(loaded, total, message) {
+            if (loadingErrorActive) return;
+            const rawPercent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+            const percent = Math.max(displayedLoadingPercent, Math.min(rawPercent, 95));
+            displayedLoadingPercent = percent;
+            document.getElementById('loading-progress-bar').style.width = `${percent}%`;
+            document.getElementById('loading-progress-text').innerText = total > 0
+                ? `${percent}%（${loaded}/${total} 个资源）`
+                : `${percent}%`;
+            if (message) document.getElementById('loading-message').innerText = message;
+        }
+
+        function hideLoadingIndicator() {
+            const overlay = document.getElementById('loading-overlay');
+            displayedLoadingPercent = 100;
+            document.getElementById('loading-progress-bar').style.width = '100%';
+            document.getElementById('loading-progress-text').innerText = '100%';
+            document.getElementById('loading-message').innerText = '加载完成';
+            overlay.setAttribute('aria-busy', 'false');
+            overlay.classList.add('hidden');
+        }
+
+        function showLoadingError(title, message, compact = false, retryMode = 'page') {
+            const overlay = document.getElementById('loading-overlay');
+            loadingErrorActive = true;
+            loadingRetryMode = retryMode;
+            overlay.classList.remove('hidden');
+            overlay.classList.add('error');
+            overlay.classList.toggle('compact', compact);
+            overlay.setAttribute('aria-busy', 'false');
+            document.getElementById('loading-title').innerText = title;
+            document.getElementById('loading-message').innerText = message;
+            document.getElementById('loading-progress-bar').style.width = '100%';
+            document.getElementById('loading-progress-bar').style.background = '#ff4d4f';
+            document.getElementById('loading-progress-text').innerText = '加载失败';
+            document.getElementById('loading-retry-btn').style.display = 'block';
+            const spinner = overlay.querySelector('.loading-spinner');
+            spinner.style.animationPlayState = 'paused';
+            spinner.style.borderTopColor = '#ff4d4f';
+        }
+
+        function retryLoading() {
+            if (loadingRetryMode === 'npc' && initialAssetsReady) {
+                npcLoadState = 'idle';
+                startNpcLazyLoad();
+                return;
+            }
+            window.location.reload();
+        }
+
+        function getAssetName(url) {
+            try {
+                const cleanUrl = url.split(/[?#]/)[0];
+                return decodeURIComponent(cleanUrl.substring(cleanUrl.lastIndexOf('/') + 1)) || '资源';
+            } catch (error) {
+                return '资源';
+            }
+        }
+
+        function createProgressManager(stageName) {
+            const manager = new THREE.LoadingManager();
+            manager.onStart = function(url, loaded, total) {
+                updateLoadingProgress(loaded, total, `${stageName}：${getAssetName(url)}`);
+            };
+            manager.onProgress = function(url, loaded, total) {
+                updateLoadingProgress(loaded, total, `${stageName}：${getAssetName(url)}`);
+            };
+            manager.onError = function(url) {
+                console.error(`资源加载失败：${url}`);
+            };
+            return manager;
+        }
+
+        function loadGLTF(modelLoader, modelUrl) {
+            return new Promise((resolve, reject) => {
+                modelLoader.load(modelUrl, resolve, undefined, error => {
+                    const reason = error instanceof Error ? error : new Error(`无法加载 ${modelUrl}`);
+                    reject(reason);
+                });
+            });
+        }
+
+        function disableModelShadows(root) {
+            root.traverse(child => {
+                if (child.isMesh) {
+                    child.castShadow = false;
+                    child.receiveShadow = false;
+                }
+            });
+        }
+
+        async function loadInitialAssets() {
+            showLoadingIndicator('正在加载训练场', '正在准备场景与玩家模型...');
+            const manager = createProgressManager('正在加载场景与玩家');
+            const initialLoader = new THREE.GLTFLoader(manager);
+
+            try {
+                const [groundGLTF, idleGLTF, walkGLTF] = await Promise.all([
+                    loadGLTF(initialLoader, MODEL_CONFIG.ground),
+                    loadGLTF(initialLoader, MODEL_CONFIG.playerIdle),
+                    loadGLTF(initialLoader, MODEL_CONFIG.playerWalk)
+                ]);
+
+                environmentMesh = groundGLTF.scene;
+                disableModelShadows(environmentMesh);
+                const box = new THREE.Box3().setFromObject(environmentMesh);
+                const center = box.getCenter(new THREE.Vector3());
+                environmentMesh.position.x -= center.x;
+                environmentMesh.position.z -= center.z;
+                environmentMesh.position.y = SCENE_Y_OFFSET;
+                scene.add(environmentMesh);
+
+                playerIdleMesh = idleGLTF.scene;
+                disableModelShadows(playerIdleMesh);
+                playerIdleMesh.scale.set(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE);
+                player.add(playerIdleMesh);
+                if (idleGLTF.animations && idleGLTF.animations.length > 0) {
+                    idleMixer = new THREE.AnimationMixer(playerIdleMesh);
+                    idleMixer.clipAction(idleGLTF.animations[0]).play();
+                }
+
+                playerWalkMesh = walkGLTF.scene;
+                disableModelShadows(playerWalkMesh);
+                playerWalkMesh.scale.set(PLAYER_SCALE, PLAYER_SCALE, PLAYER_SCALE);
+                playerWalkMesh.visible = false;
+                player.add(playerWalkMesh);
+                if (walkGLTF.animations && walkGLTF.animations.length > 0) {
+                    walkMixer = new THREE.AnimationMixer(playerWalkMesh);
+                    walkMixer.clipAction(walkGLTF.animations[0]).play();
+                }
+
+                initialAssetsReady = true;
+                gameElapsedTime = 0;
+                clock.getDelta();
+                hideLoadingIndicator();
+                document.getElementById('guide-banner').innerText = '🚀 使用 W, A, S, D 移动，Space 跳跃，先自由探索训练场吧！';
+            } catch (error) {
+                currentPhase = 'loadError';
+                showLoadingError('训练场加载失败', '场景或玩家模型未能加载，请检查文件路径后重新加载页面。');
+                console.error('初始资源加载失败：', error);
+            }
+        }
+
+        async function startNpcLazyLoad() {
+            if (!initialAssetsReady || npcLoadState !== 'idle') return;
+
+            npcLoadState = 'loading';
+            currentPhase = 'loadingNpc';
+            showLoadingIndicator('检测到机器人信号', '正在后台加载机器人模型，仍可继续探索...', true);
+            document.getElementById('guide-banner').innerText = '📡 检测到机器人信号，正在建立视觉连接...';
+
+            const manager = createProgressManager('正在加载机器人');
+            const npcLoader = new THREE.GLTFLoader(manager);
+            const stagedGroup = new THREE.Group();
+            stagedGroup.visible = false;
+            const stagedMixers = [];
+            const stagedGlitchMeshes = {};
+            const stagedGlitchActions = {};
+
+            try {
+                const centerA = new THREE.Vector3(-2.8, 0, -3.5);
+                const posB1 = new THREE.Vector3(2.2, 0, -4.5);
+                const posB2 = new THREE.Vector3(3.4, 0, -4.5);
+                const stagedGlitchRobot = new THREE.Group();
+                stagedGlitchRobot.position.copy(GLITCH_START_POS);
+                stagedGroup.add(stagedGlitchRobot);
+
+                const loadResults = await Promise.allSettled([
+                    createTrackedNPC(npcLoader, MODEL_CONFIG.robotTalk1, new THREE.Vector3(-2.8, 0, -4.3), centerA, stagedGroup, stagedMixers),
+                    createTrackedNPC(npcLoader, MODEL_CONFIG.robotTalk2, new THREE.Vector3(-3.5, 0, -3.0), centerA, stagedGroup, stagedMixers),
+                    createTrackedNPC(npcLoader, MODEL_CONFIG.robotArgue, new THREE.Vector3(-2.1, 0, -3.0), centerA, stagedGroup, stagedMixers),
+                    createTrackedNPC(npcLoader, MODEL_CONFIG.robotTalk1, posB1, posB2, stagedGroup, stagedMixers),
+                    createTrackedNPC(npcLoader, MODEL_CONFIG.robotTalk2, posB2, posB1, stagedGroup, stagedMixers),
+                    loadGlitchNPC(npcLoader, stagedGlitchRobot, stagedGlitchMeshes, stagedGlitchActions, stagedMixers)
+                ]);
+                const failedLoad = loadResults.find(result => result.status === 'rejected');
+                if (failedLoad) {
+                    stagedMixers.forEach(mixer => mixer.stopAllAction());
+                    throw failedLoad.reason;
+                }
+                const loadedNPCs = loadResults.map(result => result.value);
+
+                npcGroup = stagedGroup;
+                npcA1 = loadedNPCs[0];
+                npcA2 = loadedNPCs[1];
+                npcB1 = loadedNPCs[3];
+                glitchRobot = stagedGlitchRobot;
+                glitchMeshes = stagedGlitchMeshes;
+                glitchActions = stagedGlitchActions;
+                robotMixers = stagedMixers;
+                currentGlitchState = '';
+                isGlitchArrived = false;
+                glitchMoveTimer = 0;
+                glitchRobot.position.copy(GLITCH_START_POS);
+                setGlitchState('run');
+
+                npcGroup.visible = true;
+                scene.add(npcGroup);
+                npcAssetsReady = true;
+                npcLoadState = 'ready';
+                currentPhase = 'silentTalk';
+                hideLoadingIndicator();
+                document.getElementById('camera-toggle-btn').style.display = 'block';
+                document.getElementById('guide-banner').innerText = '📸 哨兵发现动静！点击右下角【开启巡逻相机】，近距离观察机器人在干什么吧！';
+            } catch (error) {
+                npcLoadState = 'error';
+                currentPhase = 'exploration';
+                showLoadingError('机器人加载失败', 'NPC 模型未能完整加载。你可以继续探索，或点击按钮只重试机器人。', true, 'npc');
+                document.getElementById('guide-banner').innerText = '⚠️ 机器人视觉连接失败，可在顶部重试。';
+                console.error('NPC 懒加载失败：', error);
+            }
         }
 
         function setGlitchState(stateName) {
             if (currentGlitchState === stateName) return;
+            const previousAnimation = glitchActions[currentGlitchState];
+            if (previousAnimation) previousAnimation.action.stop();
             currentGlitchState = stateName;
             Object.keys(glitchMeshes).forEach(key => {
                 if (glitchMeshes[key]) {
                     glitchMeshes[key].visible = (key === stateName);
                 }
             });
+            const nextAnimation = glitchActions[stateName];
+            if (nextAnimation) nextAnimation.action.reset().play();
         }
 
-        function loadGlitchSubModel(modelUrl, stateKey, targetGroup, isVisible, isRed) {
-            loader.load(modelUrl, function(gltf) {
-                const mesh = gltf.scene;
-                mesh.scale.set(ROBOT_SCALE, ROBOT_SCALE, ROBOT_SCALE);
-                mesh.rotation.y = 0; 
-                mesh.visible = isVisible;
-                targetGroup.add(mesh);
-                glitchMeshes[stateKey] = mesh;
+        async function loadGlitchSubModel(modelLoader, modelUrl, stateKey, targetGroup, isRed, meshTarget, actionTarget, mixerTarget) {
+            const gltf = await loadGLTF(modelLoader, modelUrl);
+            const mesh = gltf.scene;
+            disableModelShadows(mesh);
+            mesh.scale.set(ROBOT_SCALE, ROBOT_SCALE, ROBOT_SCALE);
+            mesh.rotation.y = 0;
+            mesh.visible = false;
+            targetGroup.add(mesh);
+            meshTarget[stateKey] = mesh;
 
-                if (isRed) {
-                    mesh.traverse(child => {
-                        if(child.isMesh && child.material) {
-                            child.material = child.material.clone(); 
-                            child.material.emissive = new THREE.Color(0xff0000); 
-                            child.material.emissiveIntensity = 0.6;
+            if (isRed) {
+                mesh.traverse(child => {
+                    if (!child.isMesh || !child.material) return;
+                    const sourceMaterials = Array.isArray(child.material) ? child.material : [child.material];
+                    const clonedMaterials = sourceMaterials.map(material => {
+                        const clonedMaterial = material.clone();
+                        if (clonedMaterial.emissive) {
+                            clonedMaterial.emissive.setHex(0xff0000);
+                            clonedMaterial.emissiveIntensity = 0.6;
                         }
+                        return clonedMaterial;
                     });
-                }
+                    child.material = Array.isArray(child.material) ? clonedMaterials : clonedMaterials[0];
+                });
+            }
 
-                if(gltf.animations && gltf.animations.length > 0){
-                    const mixer = new THREE.AnimationMixer(mesh); 
-                    mixer.clipAction(gltf.animations[0]).play(); 
-                    robotMixers.push(mixer);
-                }
-            });
+            if (gltf.animations && gltf.animations.length > 0) {
+                const mixer = new THREE.AnimationMixer(mesh);
+                const action = mixer.clipAction(gltf.animations[0]);
+                actionTarget[stateKey] = { mixer, action };
+                mixerTarget.push(mixer);
+            }
+            return mesh;
         }
 
        function createWarningSprite() {
@@ -421,15 +685,19 @@
             return sprite;
         }
 
-        function loadGlitchNPC(targetGroup) {
-            loadGlitchSubModel(MODEL_CONFIG.glitchRun, 'run', targetGroup, true, true);
-            currentGlitchState = 'run';
-            
-            loadGlitchSubModel(MODEL_CONFIG.glitchJump, 'jump', targetGroup, false, true);
-            loadGlitchSubModel(MODEL_CONFIG.glitchDance, 'dance', targetGroup, false, false);
-            loadGlitchSubModel(MODEL_CONFIG.robotTalk1, 'talk', targetGroup, false, false);
+        async function loadGlitchNPC(modelLoader, targetGroup, meshTarget, actionTarget, mixerTarget) {
+            const results = await Promise.allSettled([
+                loadGlitchSubModel(modelLoader, MODEL_CONFIG.glitchRun, 'run', targetGroup, true, meshTarget, actionTarget, mixerTarget),
+                loadGlitchSubModel(modelLoader, MODEL_CONFIG.glitchJump, 'jump', targetGroup, true, meshTarget, actionTarget, mixerTarget),
+                loadGlitchSubModel(modelLoader, MODEL_CONFIG.glitchDance, 'dance', targetGroup, false, meshTarget, actionTarget, mixerTarget),
+                loadGlitchSubModel(modelLoader, MODEL_CONFIG.robotTalk1, 'talk', targetGroup, false, meshTarget, actionTarget, mixerTarget)
+            ]);
+            const failedLoad = results.find(result => result.status === 'rejected');
+            if (failedLoad) throw failedLoad.reason;
 
             const hitbox = new THREE.Mesh(new THREE.BoxGeometry(2.5, 2.0, 2.5), new THREE.MeshBasicMaterial({ visible: false })); 
+            hitbox.castShadow = false;
+            hitbox.receiveShadow = false;
             hitbox.position.y = 1.0; 
             hitbox.name = "Glitch_Target"; 
             targetGroup.add(hitbox);
@@ -437,27 +705,27 @@
             core.position.set(0, 2.2, 0); // 设置在机器人头顶的高处 (y = 2.4)
             core.name = "glitchCore"; 
             targetGroup.add(core);
-           
+            return targetGroup;
         }
 
-        function createTrackedNPC(modelUrl, pos, lookTarget) {
+        async function createTrackedNPC(modelLoader, modelUrl, pos, lookTarget, targetGroup, mixerTarget) {
+            const gltf = await loadGLTF(modelLoader, modelUrl);
             const container = new THREE.Group();
             container.position.copy(pos);
-            npcGroup.add(container); 
+            targetGroup.add(container);
 
-            loader.load(modelUrl, function(gltf) {
-                const mesh = gltf.scene;
-                mesh.scale.set(ROBOT_SCALE, ROBOT_SCALE, ROBOT_SCALE);
-                mesh.rotation.y = 0; 
-                container.add(mesh);
-                container.lookAt(lookTarget.x, container.position.y, lookTarget.z);
+            const mesh = gltf.scene;
+            disableModelShadows(mesh);
+            mesh.scale.set(ROBOT_SCALE, ROBOT_SCALE, ROBOT_SCALE);
+            mesh.rotation.y = 0;
+            container.add(mesh);
+            container.lookAt(lookTarget.x, container.position.y, lookTarget.z);
 
-                if(gltf.animations && gltf.animations.length > 0){
-                    const mixer = new THREE.AnimationMixer(mesh); 
-                    mixer.clipAction(gltf.animations[0]).play(); 
-                    robotMixers.push(mixer);
-                }
-            });
+            if (gltf.animations && gltf.animations.length > 0) {
+                const mixer = new THREE.AnimationMixer(mesh);
+                mixer.clipAction(gltf.animations[0]).play();
+                mixerTarget.push(mixer);
+            }
             return container;
         }
 
@@ -473,7 +741,7 @@
         }
 
         function toggleCameraMode() {
-            if(isRecordingSequence || isPracticeGameActive) return;
+            if (!npcAssetsReady || isRecordingSequence || isPracticeGameActive) return;
             isCameraMode = !isCameraMode;
             const btn = document.getElementById('camera-toggle-btn');
             const viewfinder = document.getElementById('viewfinder-ui');
@@ -497,6 +765,7 @@
                 if (playerIdleMesh) playerIdleMesh.visible = true;
                 if (playerWalkMesh) playerWalkMesh.visible = false;
                 controls.minDistance = 4.0; controls.maxDistance = 15.0;
+                currentPhase = isGlitchFixed ? 'fixed' : 'silentTalk';
                 
                 controls.target.copy(player.position).y += 0.65;
                 camera.position.set(player.position.x, player.position.y + 5.5, player.position.z + 6.5);
@@ -579,7 +848,7 @@
             const el = document.getElementById(elementId);
             if (!el || !camera) return;
             
-            if (currentPhase === 'exploration') {
+            if (!npcAssetsReady || currentPhase === 'exploration' || currentPhase === 'loadingNpc') {
                 el.style.display = 'none';
                 return;
             } else if (currentPhase === 'silentTalk') {
@@ -609,6 +878,7 @@
         }
 
         function onKeyDown(event) {
+            if (!initialAssetsReady) return;
             if (isPracticeGameActive && !isRecordingSequence) {
                 if (event.code === 'ArrowLeft' || event.code === 'KeyA') mockDistancePercent = Math.max(0, mockDistancePercent - 2);
                 if (event.code === 'ArrowRight' || event.code === 'KeyD') mockDistancePercent = Math.min(95, mockDistancePercent + 2);
@@ -643,13 +913,10 @@
             requestAnimationFrame(animate);
             const delta = clock.getDelta(); const time = clock.getElapsedTime();
 
-            if (currentPhase !== 'activeCamera' && !isGlitchFixed) {
+            if (initialAssetsReady && currentPhase === 'exploration' && npcLoadState === 'idle') {
                 gameElapsedTime += delta;
-                if (currentPhase === 'exploration' && gameElapsedTime >= 10.0) {
-                    currentPhase = 'silentTalk';
-                    npcGroup.visible = true; 
-                    document.getElementById('camera-toggle-btn').style.display = 'block'; 
-                    document.getElementById('guide-banner').innerText = "📸 哨兵发现动静！点击右下角【开启巡逻相机】，近距离观察机器人在干什么吧！";
+                if (gameElapsedTime >= NPC_LOAD_DELAY_SECONDS) {
+                    startNpcLazyLoad();
                 }
             }
 
@@ -682,7 +949,7 @@
                 updateBubblePosition('bubble-glitch', glitchRobot.position, 2.4, "🤖 新队员：<br>“你们也喜欢看昨晚的比赛吗？”");
             }
 
-            if (!isRecordingSequence && !isPracticeGameActive && glitchRobot && !isGlitchFixed) {
+            if (npcAssetsReady && !isRecordingSequence && !isPracticeGameActive && glitchRobot && !isGlitchFixed) {
                 if (!isGlitchArrived) {
                     setGlitchState('run'); 
                     glitchRobot.position.lerp(GLITCH_TARGET_POS, 1.4 * delta);
@@ -753,7 +1020,7 @@
                     document.getElementById('record-action-btn').style.display = (foundGlitch && !isGlitchFixed) ? 'block' : 'none';
                 }
             } 
-            else if (!isCameraMode && !isRecordingSequence && !isPracticeGameActive && player) {
+            else if (initialAssetsReady && !isCameraMode && !isRecordingSequence && !isPracticeGameActive && player) {
                 playerVelocity.y -= GRAVITY * delta; 
                 const direction = new THREE.Vector3(0, 0, 0);
 
